@@ -10,13 +10,15 @@ import numpy as np
 import scipy.sparse as sps
 import scipy.linalg as la
 
+from time import time
 from dipy.reconst.base import ReconstModel, ReconstFit
 from dipy.tracking.utils import unique_rows
 from dipy.tracking.streamline import transform_streamlines
 from dipy.tracking.vox2track import _voxel2streamline
 import dipy.data as dpd
 import dipy.core.optimize as opt
-
+import multiprocessing as mp
+import pickle
 
 def gradient(f):
     """
@@ -80,7 +82,10 @@ def gradient(f):
         slice2[axis] = 1
         slice3[axis] = 0
         # 1D equivalent -- out[0] = (f[1] - f[0])
-        out[tuple(slice1)] = (f[tuple(slice2)] - f[tuple(slice3)])
+        try:
+            out[tuple(slice1)] = (f[tuple(slice2)] - f[tuple(slice3)])
+        except IndexError:
+            raise IndexError("something weird")
         slice1[axis] = -1
         slice2[axis] = -1
         slice3[axis] = -2
@@ -218,7 +223,7 @@ class LifeSignalMaker(object):
         evals : list of 3 items
             The eigenvalues of the canonical tensor to use in calculating the
             signal.
-        sphere : `dipy.core.Sphere` class instance
+        n_points : `dipy.core.Sphere` class instance
             The discrete sphere to use as an approximation for the continuous
             sphere on which the signal is represented. If integer - we will use
             an instance of one of the symmetric spheres cached in
@@ -261,6 +266,17 @@ class LifeSignalMaker(object):
             sig_out[ii] = self.calc_signal(g)
         return sig_out
 
+
+def fiber_treatment(s,idx,gtab,evals,SignalMaker,sphere=None):
+    streamshape = np.shape(np.asarray(s))
+    if streamshape[0] > 1:
+        if sphere is not False:
+            fiber_signal=SignalMaker.streamline_signal(s)
+        else:
+            fiber_signal=streamline_signal(s, self.gtab, evals)
+    else:
+        fiber_signal=None
+    return(fiber_signal)
 
 def voxel2streamline(streamline, affine, unique_idx=None):
     """
@@ -323,7 +339,7 @@ class FiberModel(ReconstModel):
         # Initialize the super-class:
         ReconstModel.__init__(self, gtab)
 
-    def setup(self, streamline, affine, evals=[0.001, 0, 0], sphere=None):
+    def setup(self, streamline, affine, evals=[0.001, 0, 0], sphere=None, processes=1, verbose=False):
         """
         Set up the necessary components for the LiFE model: the matrix of
         fiber-contributions to the DWI signal, and the coordinates of voxels
@@ -353,7 +369,23 @@ class FiberModel(ReconstModel):
                                           sphere=sphere)
 
         streamline = transform_streamlines(streamline, affine)
+
+        #picklepath1 = '/Users/alex/jacques/fiber_signal_parallel.p'
+        #fiber_signal=pickle.load(open(picklepath1, "rb"))
+        #picklepath2 = '/Users/alex/jacques/fiber_signal_orig.p'
+        #fiber_signal_orig=pickle.load(open(picklepath2, "rb"))
+
+        #original location of the vox steps, moved them for faster streamline processing debug
+        fiber_signal = []
+        fiber_signal_orig = []
+        fiber_signal_list = []
+        skiplist=[]
+
+        #the stuff that got moved around for faster processing
         # Assign some local variables, for shorthand:
+        #if save_fibsignal:
+        #    pickle.dump(fiber_signal, open(picklepath1, "wb"))
+
         all_coords = np.concatenate(streamline)
         vox_coords = unique_rows(np.round(all_coords).astype(np.intp))
         del all_coords
@@ -364,22 +396,51 @@ class FiberModel(ReconstModel):
         # How many fibers in each voxel (this will determine how many
         # components are in the matrix):
         n_unique_f = len(np.hstack(v2f.values()))
+
+        """
+
+        save_fibsignal=True
+        picklepath1 = '/Users/alex/jacques/fiber_signal_parallel_rev.p'
+        picklepath2 = '/Users/alex/jacques/fiber_signal_parallel.p'
+        try:
+            fiber_signal = pickle.load(open(picklepath1, "rb"))
+            save_fibsignal=False
+            print("getting Fiber signal from" + picklepath1)
+            fiber_signal_orig = pickle.load(open(picklepath2, "rb"))
+        except FileNotFoundError:
+        """
+        print("computing the fiber signal values")
+        duration1=time()
+        if processes > 1:
+            pool = mp.Pool(processes)
+            fiber_signal = pool.starmap_async(fiber_treatment,[(s,idx,self.gtab,evals,SignalMaker,sphere) for idx, s in enumerate(streamline)]).get()
+            #for idx,fiber in enumerate(fiber_signal_list):
+            pool.close()
+        else:
+            for s_idx, s in enumerate(streamline):
+                streamshape=np.shape(np.asarray(s))
+                if sphere is not False:
+                    fiber_signal.append(SignalMaker.streamline_signal(s))
+                else:
+                    fiber_signal.append(streamline_signal(s, self.gtab, evals))
+                #print("Took care of "+ str(s_idx) + " out of " + str(len(streamline)) + " streamlines")
+
+        if verbose:
+            print("Obtaining fiber signal process done in " + str(time() - duration1) + "s")
+            if len(skiplist)>0:
+                print("Skipped "+ str(len(skiplist)) + " out of " + str(len(streamline)) + "due to size constraints (tiny streamlines)")
+
+        if sphere is not False:
+            del SignalMaker
+
+
         # Preallocate these, which will be used to generate the sparse
         # matrix:
         f_matrix_sig = np.zeros(n_unique_f * n_bvecs, dtype=np.float)
         f_matrix_row = np.zeros(n_unique_f * n_bvecs, dtype=np.intp)
         f_matrix_col = np.zeros(n_unique_f * n_bvecs, dtype=np.intp)
-
-        fiber_signal = []
-        for s_idx, s in enumerate(streamline):
-            if sphere is not False:
-                fiber_signal.append(SignalMaker.streamline_signal(s))
-            else:
-                fiber_signal.append(streamline_signal(s, self.gtab, evals))
-
+        #end of moved block JS
         del streamline
-        if sphere is not False:
-            del SignalMaker
 
         keep_ct = 0
         range_bvecs = np.arange(n_bvecs).astype(int)
@@ -396,7 +457,11 @@ class FiberModel(ReconstModel):
                 vox_fiber_sig = np.zeros(n_bvecs)
                 for node_idx in v2fn[f_idx][v_idx]:
                     # Sum the signal from each node of the fiber in that voxel:
-                    vox_fiber_sig += fiber_signal[f_idx][node_idx]
+                    try:
+                        vox_fiber_sig += fiber_signal[f_idx][node_idx]
+                    except IndexError:
+                        print("hi")
+                        raise IndexError
                 # And add the summed thing into the corresponding rows:
                 f_matrix_sig[keep_ct:keep_ct+n_bvecs] += vox_fiber_sig
                 keep_ct = keep_ct + n_bvecs
@@ -424,7 +489,7 @@ class FiberModel(ReconstModel):
         # Fitting is done on the S0-normalized-and-demeaned diffusion-weighted
         # signal:
         idx_tuple = (vox_coords[:, 0], vox_coords[:, 1], vox_coords[:, 2])
-        # We'll look at a 2D array, extracting the data from the voxels:
+        # We'll look at a 2D array, extracting the data from the voxels: idx_tuple[0][0],idx_tuple[0][1],idx_tuple[0][2]
         vox_data = data[idx_tuple]
         weighted_signal = vox_data[:, ~self.gtab.b0s_mask]
         b0_signal = np.mean(vox_data[:, self.gtab.b0s_mask], -1)
@@ -437,7 +502,7 @@ class FiberModel(ReconstModel):
                 vox_data)
 
     def fit(self, data, streamline, affine, evals=[0.001, 0, 0],
-            sphere=None):
+            sphere=None, processes=1, verbose=False):
         """
         Fit the LiFE FiberModel for data and a set of streamlines associated
         with this data
@@ -468,10 +533,28 @@ class FiberModel(ReconstModel):
         if affine is None:
             affine = np.eye(4)
         life_matrix, vox_coords = \
-            self.setup(streamline, affine, evals=evals, sphere=sphere)
+            self.setup(streamline, affine, evals=evals, sphere=sphere, processes=processes, verbose=verbose)
         (to_fit, weighted_signal, b0_signal, relative_signal, mean_sig,
          vox_data) = self._signals(data, vox_coords)
         beta = opt.sparse_nnls(to_fit, life_matrix)
+
+        """
+        nanvals=0
+        for i in range(np.shape(relative_signal)[0]):
+            for j in range(np.shape(relative_signal)[1]):
+                if math.isnan(relative_signal[i,j]):
+                    nanvals += 1
+                    
+        print(str(nanvals) + " out of " + str(np.size(relative_signal)))
+        
+        nanvals = 0
+        for i in range(np.shape(mean_sig)[0]):
+            if math.isnan(mean_sig[i]):
+                    nanvals += 1
+        
+        print(str(nanvals) + " out of " + str(np.size(mean_sig)))
+        """
+
         return FiberFit(self, life_matrix, vox_coords, to_fit, beta,
                         weighted_signal, b0_signal, relative_signal, mean_sig,
                         vox_data, streamline, affine, evals)
